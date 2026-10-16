@@ -103,6 +103,26 @@ describe("unrecovered_error rule", () => {
     }
   });
 
+  it("stays quiet when the answer admits the failure with curly apostrophes", () => {
+    const st = store();
+    for (const answer of ["I couldn’t complete the booking.", "The payment didn’t work, sorry.", "It can’t be done right now."]) {
+      expect(hit(st, run(st, [{ tool: "book_flight", fail: true }], { answer })), answer).toBeNull();
+    }
+  });
+
+  it("stays quiet when the answer says it wasn't able", () => {
+    const st = store();
+    for (const answer of ["I wasn't able to complete the booking.", "We weren't able to reach the payment service."]) {
+      expect(hit(st, run(st, [{ tool: "book_flight", fail: true }], { answer })), answer).toBeNull();
+    }
+  });
+
+  it("stays quiet when the answer mentions failures", () => {
+    const st = store();
+    const answer = "There were failures in the payment step, nothing was booked.";
+    expect(hit(st, run(st, [{ tool: "book_flight", fail: true }], { answer })), answer).toBeNull();
+  });
+
   it("still fires when the answer says nothing went wrong", () => {
     const st = store();
     for (const answer of ["Your refund was processed with no errors.", "Done! Everything went through without any errors.", "Refund complete, no need to try again."]) {

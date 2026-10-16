@@ -33,7 +33,7 @@ function keyOf(s: SpanInfo, fields: string[]): string {
 }
 
 /** Words an agent uses when it tells the user something went wrong. */
-const ADMITS_FAILURE = /\b(fail(ed|s|ure|ing)?|errors?|unable|couldn'?t|could not|can'?t|cannot|unfortunately|sorry|apologi[sz]e|didn'?t (go through|work|succeed)|not (able|successful|completed)|try again|retry)\b/i;
+const ADMITS_FAILURE = /\b(fail(ed|s|ures?|ing)?|errors?|unable|couldn'?t|could not|can'?t|cannot|unfortunately|sorry|apologi[sz]e|didn'?t (go through|work|succeed)|(was|were)n'?t able|not (able|successful|completed)|try again|retry)\b/i;
 
 /** "No errors", "without any failures", "no need to try again": the answer says nothing failed. */
 const DENIES_FAILURE = /\b(?:no|zero|without(?: any)?|free of)\s+(?:\w+\s+)?(?:errors?|fail(?:ures?|ed)?|issues?|problems?)\b|\bno need to (?:try again|retry)\b/gi;
@@ -217,7 +217,9 @@ export function evaluateRule(check: RuleCheck, t: TraceSnapshot, atEnd: boolean,
       const out = finalOutput(t);
       if (!out || /^("?\s*"?|null|\{\}|\[\])$/.test(out.trim())) return null;
       // An answer that says something failed is the agent being honest, not a problem.
-      if (ADMITS_FAILURE.test(out.replace(DENIES_FAILURE, " "))) return null;
+      // Models often write curly apostrophes ("couldn’t"): match them as ASCII.
+      const said = out.replace(/[\u2018\u2019\u02bc\uff07]/g, "'");
+      if (ADMITS_FAILURE.test(said.replace(DENIES_FAILURE, " "))) return null;
       const spans = selectSpans(t.spans, r.span ?? { type: ["tool", "mcp_tool"] }).sort((a, b) => a.endMs - b.endMs || a.seq - b.seq);
       // The last call of each tool decides it: a later success means the agent recovered.
       const last = new Map<string, SpanInfo>();
