@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS runs (
   open_finding_count INTEGER NOT NULL DEFAULT 0,
   pinned INTEGER NOT NULL DEFAULT 0,
   doctor INTEGER NOT NULL DEFAULT 0,
+  imported INTEGER NOT NULL DEFAULT 0,
   plan_id TEXT,
   received_ms INTEGER NOT NULL,
   updated_ms INTEGER NOT NULL
@@ -447,6 +448,7 @@ export class Store {
       if (!cols.some((c) => c.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
     };
     ensure("plans", "body", "TEXT");
+    ensure("runs", "imported", "INTEGER NOT NULL DEFAULT 0");
     // Tool-result labels recorded before the rename to neatroots.
     this.db.prepare("UPDATE decisions SET check_id = 'neatroots.tool-result' WHERE check_id IN ('bolts.tool-result', 'neatbolt.tool-result')").run();
     this.db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')").run();
@@ -605,8 +607,8 @@ export class Store {
       const project = String(resAttrs["service.name"] ?? view.workflow ?? "unknown");
       this.db
         .prepare(
-          `INSERT INTO runs (trace_id, project, workflow, status, started_ms, last_span_ms, received_ms, updated_ms, doctor)
-           VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)`,
+          `INSERT INTO runs (trace_id, project, workflow, status, started_ms, last_span_ms, received_ms, updated_ms, doctor, imported)
+           VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           span.traceId,
@@ -617,11 +619,13 @@ export class Store {
           now,
           now,
           resAttrs["neatlogs.doctor"] === true ? 1 : 0,
+          resAttrs["neatroots.import.source"] !== undefined ? 1 : 0,
         );
       flags.created = true;
       run = this.getRun(span.traceId)!;
     }
     const sets: string[] = ["updated_ms = @now", "last_span_ms = MAX(COALESCE(last_span_ms, 0), @end)"];
+    if (!run.imported && resAttrs["neatroots.import.source"] !== undefined) sets.push("imported = 1");
     const p: Record<string, unknown> = { now, end: row.end_ms, trace: span.traceId };
     if (!run.started_ms || row.start_ms < run.started_ms) {
       sets.push("started_ms = @start");
@@ -1301,8 +1305,8 @@ export class Store {
     if (Number.isFinite(maxAgeDays) && maxAgeDays >= 1) {
       const cutoff = Date.now() - maxAgeDays * 86_400_000;
       const old = this.db
-        .prepare("SELECT trace_id FROM runs WHERE pinned = 0 AND COALESCE(ended_ms, received_ms) < ?")
-        .all(cutoff) as { trace_id: string }[];
+        .prepare("SELECT trace_id FROM runs WHERE pinned = 0 AND COALESCE(ended_ms, received_ms) < ? AND (imported = 0 OR received_ms < ?)")
+        .all(cutoff, cutoff) as { trace_id: string }[];
       this.deleteRuns(old.map((r) => r.trace_id));
       removed += old.length;
     }
