@@ -10,6 +10,7 @@ import type { SteeringHub } from "../steering/hub.js";
 import {
   buildEvidence,
   describeSpan,
+  type BuiltEvidence,
   finalOutput,
   loadTrace,
   matchesSelector,
@@ -64,6 +65,8 @@ const INVESTIGATE_AT = 2.5;
 
 /** A session question is judged over at most this many earlier runs of the session (the newest ones). */
 const SESSION_RUN_LOOKBACK = 25;
+const SESSION_EARLIER_SPANS = 6;
+const SESSION_EARLIER_BUDGET = 2000;
 
 interface LiveRun {
   traceId: string;
@@ -527,8 +530,10 @@ export class Engine {
   private sessionSnapshot(traceId: string, snap: TraceSnapshot): TraceSnapshot {
     const sessionId = snap.run?.session_id;
     if (!sessionId) return snap;
+    // Only turns that started before this run: rechecking an older run must not see the future.
+    const startedMs = snap.run?.started_ms;
     const earlier = this.roots.store
-      .listRuns({ sessionId, limit: SESSION_RUN_LOOKBACK + 1 })
+      .listRuns({ sessionId, limit: SESSION_RUN_LOOKBACK + 1, ...(startedMs ? { untilMs: startedMs - 1 } : {}) })
       .filter((r) => r.trace_id !== traceId && r.status !== "running")
       .reverse();
     if (!earlier.length) return snap;
@@ -537,12 +542,33 @@ export class Engine {
     return { traceId, run: snap.run, spans: [...spans, ...snap.spans] };
   }
 
+  /** Evidence for a session question: the run in hand under the usual limits, plus a bounded tail of
+   * the earlier turns' spans. `evidence.last` over the merged list would let a busy current run crowd
+   * the earlier turns out, and those turns are the point of a session question. */
+  private sessionEvidence(check: QuestionCheck, snap: TraceSnapshot): BuiltEvidence {
+    const merged = this.sessionSnapshot(snap.traceId, snap);
+    const own = new Set(snap.spans.map((s) => s.id));
+    const earlierSpans = merged.spans.filter((s) => !own.has(s.id));
+    const ev = buildEvidence(snap, { ...check.evidence, final_output: false });
+    if (earlierSpans.length) {
+      const earlier = buildEvidence(
+        { traceId: merged.traceId, run: merged.run, spans: earlierSpans },
+        { spans: check.evidence?.spans, fields: check.evidence?.fields, last: SESSION_EARLIER_SPANS, goal: false },
+        { budget: SESSION_EARLIER_BUDGET },
+      );
+      if (earlier.spanIds.length) {
+        ev.text = `Earlier turns in this session:\n${earlier.text}\n\nCurrent run:\n${ev.text}`;
+        ev.spanIds = [...earlier.spanIds, ...ev.spanIds];
+      }
+    }
+    return ev;
+  }
+
   /** A session question is judged at each run's end over the session's spans so far, oldest first.
    * The finding pins to the run in hand (findings are per trace), with evidence from that run. */
   private async askSession(run: LiveRun, check: QuestionCheck, params: Record<string, string>, snap: TraceSnapshot): Promise<void> {
-    const merged = this.sessionSnapshot(run.traceId, snap);
     // The final answer must be this run's: the merged spans' first root is the session's oldest turn.
-    const ev = buildEvidence(merged, { ...check.evidence, final_output: false });
+    const ev = this.sessionEvidence(check, snap);
     if (check.evidence?.final_output) {
       const out = finalOutput(snap);
       if (out) ev.text += `\n\nFinal answer (this run): ${clip(out, 1500)}`;
@@ -1206,28 +1232,34 @@ ${library}`;
     truncated: boolean;
   }> {
     const limit = opts.limit ?? 50;
+    const sessionQ = !isRule(check) && check.scope === "session";
     // Only runs the check would watch: the engine skips runs outside its applies_to, so a preview
     // over them would report hits the check can never raise. Look further back to still fill `limit`.
-    const runs = this.roots.store
-      .listRuns({ workflow: opts.workflow, project: opts.project, limit: check.applies_to ? 500 : limit })
+    const eligible = this.roots.store
+      .listRuns({ workflow: opts.workflow, project: opts.project, limit: check.applies_to || sessionQ ? 500 : limit })
       .filter((r) => r.status !== "running")
-      .filter((r) => this.appliesTo(check, { project: r.project ?? "unknown", workflow: r.workflow ?? r.project ?? "unknown" }))
-      .slice(0, limit);
+      .filter((r) => this.appliesTo(check, { project: r.project ?? "unknown", workflow: r.workflow ?? r.project ?? "unknown" }));
+    // A session question is previewed once per session, on its newest run: pick distinct sessions
+    // before the limit, so one chatty session can't crowd the others out of the window.
+    const runs: typeof eligible = [];
+    if (sessionQ) {
+      const seen = new Set<string>();
+      for (const r of eligible) {
+        const sid = r.session_id ?? r.trace_id;
+        if (seen.has(sid)) continue;
+        seen.add(sid);
+        runs.push(r);
+        if (runs.length >= limit) break;
+      }
+    } else {
+      runs.push(...eligible.slice(0, limit));
+    }
     const deadline = Date.now() + (opts.timeBudgetMs ?? 90_000);
-    const seenSessions = new Set<string>();
     const hits: { trace_id: string; probability: number | null; evidence_span_ids: string[]; root_name: string | null }[] = [];
     let checked = 0;
     for (const r of runs) {
       if (Date.now() > deadline) break;
       const snap = loadTrace(this.roots.store, r.trace_id);
-      let evSnap = snap;
-      if (!isRule(check) && check.scope === "session") {
-        // Preview the newest run of each session over its history so far; older runs would repeat it.
-        const sid = r.session_id ?? r.trace_id;
-        if (seenSessions.has(sid)) continue;
-        seenSessions.add(sid);
-        evSnap = this.sessionSnapshot(r.trace_id, snap);
-      }
       checked++;
       if (isRule(check)) {
         // A previewed check is a draft someone (or a coding agent) wrote, so its pattern is timed.
@@ -1239,7 +1271,7 @@ ${library}`;
       const ownIds = check.scope === "session" ? new Set(snap.spans.map((s) => s.id)) : undefined;
       for (const focus of targets) {
         // The final answer must be this run's: the merged session spans' first root is the oldest turn.
-        const ev = buildEvidence(evSnap, check.scope === "session" ? { ...check.evidence, final_output: false } : check.evidence, { focus });
+        const ev = !isRule(check) && check.scope === "session" ? this.sessionEvidence(check, snap) : buildEvidence(snap, check.evidence, { focus });
         if (check.scope === "session" && check.evidence?.final_output) {
           const out = finalOutput(snap);
           if (out) ev.text += `\n\nFinal answer (this run): ${clip(out, 1500)}`;
