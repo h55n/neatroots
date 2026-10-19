@@ -55,6 +55,55 @@ echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'`,
   });
 });
 
+function nodeScript(name: string, body: string): string {
+  const f = path.join(dir!, name);
+  fs.writeFileSync(f, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
+  return f;
+}
+
+describe.skipIf(process.platform === "win32")("a chat whose agent splits multibyte UTF-8 across pipe chunks (#616)", () => {
+  it("decodes stdout without replacement characters", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "neatroots-chat-"));
+    process.env.HOME = dir;
+    const text = "h\u00e9llo \ud83d\ude00 \u4e16\u754c";
+    process.env.NEATROOTS_CODEX_BIN = nodeScript(
+      "codex",
+      `const text = ${JSON.stringify(text)};
+const line1 = JSON.stringify({ type: "item.completed", item: { id: "i1", type: "agent_message", text } });
+const line2 = JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } });
+const out = Buffer.concat([Buffer.from(line1 + "\\n", "utf8"), Buffer.from(line2 + "\\n", "utf8")]);
+const cut = out.indexOf(0xf0) + 2; // mid-character
+process.stdout.write(out.subarray(0, cut), () => setTimeout(() => process.stdout.write(out.subarray(cut)), 50));`,
+    );
+    t = await makeRoots({ noEngine: true });
+    const s = t.roots.chats.create({ agent: "codex", cwd: dir });
+    await t.roots.chats.send(s.id, "hi");
+    await poll(async () => t!.roots.chats.events(s.id).some((e) => e.kind === "text"));
+    const texts = t.roots.chats.events(s.id).filter((e) => e.kind === "text").map((e) => e.text);
+    expect(texts).toEqual([text]);
+    expect(texts.join("")).not.toContain("\ufffd");
+  });
+
+  it("decodes stderr without replacement characters when the turn fails", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "neatroots-chat-"));
+    process.env.HOME = dir;
+    const warning = "provider warning: h\u00e9llo \ud83d\ude00 \u4e16\u754c";
+    process.env.NEATROOTS_CODEX_BIN = nodeScript(
+      "codex",
+      `const err = Buffer.from(${JSON.stringify(warning + "\n")}, "utf8");
+const cut = err.indexOf(0xf0) + 2; // mid-character
+process.stderr.write(err.subarray(0, cut), () => setTimeout(() => process.stderr.write(err.subarray(cut), () => process.exit(2)), 50));`,
+    );
+    t = await makeRoots({ noEngine: true });
+    const s = t.roots.chats.create({ agent: "codex", cwd: dir });
+    await t.roots.chats.send(s.id, "hi");
+    await poll(async () => t!.roots.chats.events(s.id).some((e) => e.kind === "error"));
+    const errors = t.roots.chats.events(s.id).filter((e) => e.kind === "error").map((e) => e.text);
+    expect(errors).toEqual([warning]);
+    expect(errors.join("")).not.toContain("\ufffd");
+  });
+});
+
 describe.skipIf(process.platform === "win32")("deleting a chat while the agent is answering", () => {
   it("cancels it and writes no further events for the removed session", async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), "neatroots-chat-"));

@@ -285,9 +285,12 @@ export class AgentChats {
     let buf = "";
     let stderr = "";
     let sawResult = false;
-    child.stdout!.on("data", (b: Buffer) => {
+    // Decode with the stream's UTF-8 decoder so a multibyte character split across
+    // pipe read boundaries is buffered instead of becoming U+FFFD (issue #616).
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
       if (!this.get(id)) return;
-      buf += b.toString();
+      buf += chunk;
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl).trim();
@@ -301,8 +304,9 @@ export class AgentChats {
         }
       }
     });
-    child.stderr!.on("data", (b: Buffer) => {
-      stderr = (stderr + b.toString()).slice(-4000);
+    child.stderr!.setEncoding("utf8");
+    child.stderr!.on("data", (chunk: string) => {
+      stderr = (stderr + chunk).slice(-4000);
     });
     await new Promise<void>((resolve) => {
       let done = false;
