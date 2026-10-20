@@ -73,4 +73,33 @@ describe("imported run retention", () => {
     expect(st.sweep(14, Number.POSITIVE_INFINITY)).toBe(0);
     expect(st.getRun(t)).toBeDefined();
   });
+
+  it("ages an imported run by its receipt time even when its spans ended recently", () => {
+    const st = store();
+    const t = hex(16);
+    st.ingest([historicalBatch(t, 1, true)]);
+    st.db.prepare("UPDATE runs SET received_ms = ? WHERE trace_id = ?").run(Date.now() - 15 * 86_400_000, t);
+    expect(st.sweep(14, Number.POSITIVE_INFINITY)).toBe(1);
+    expect(st.getRun(t)).toBeUndefined();
+  });
+
+  it("protects runs imported before the imported column existed, after an upgrade", () => {
+    const h = tmpHome();
+    homes.push(h);
+    const dir = path.join(h, "data");
+    const old = trackedStore(dir);
+    const imported = hex(16);
+    const live = hex(16);
+    old.ingest([historicalBatch(imported, 20, true), historicalBatch(live, 20, false)]);
+    // Put the database back in its pre-upgrade shape: no imported column.
+    old.db.exec("ALTER TABLE runs DROP COLUMN imported");
+    old.close();
+    const upgraded = trackedStore(dir);
+    expect((upgraded.db.prepare("SELECT imported FROM runs WHERE trace_id = ?").get(imported) as { imported: number }).imported).toBe(1);
+    expect((upgraded.db.prepare("SELECT imported FROM runs WHERE trace_id = ?").get(live) as { imported: number }).imported).toBe(0);
+    // The sweep keeps the imported run (received just now) and prunes the old live one.
+    expect(upgraded.sweep(14, Number.POSITIVE_INFINITY)).toBe(1);
+    expect(upgraded.getRun(imported)).toBeDefined();
+    expect(upgraded.getRun(live)).toBeUndefined();
+  });
 });

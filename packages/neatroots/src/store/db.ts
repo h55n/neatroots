@@ -445,10 +445,22 @@ export class Store {
   private migrate(): void {
     const ensure = (table: string, column: string, type: string) => {
       const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-      if (!cols.some((c) => c.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      if (cols.some((c) => c.name === column)) return false;
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      return true;
     };
     ensure("plans", "body", "TEXT");
-    ensure("runs", "imported", "INTEGER NOT NULL DEFAULT 0");
+    if (ensure("runs", "imported", "INTEGER NOT NULL DEFAULT 0")) {
+      // Runs stored before this column existed: mark the ones whose resource carries the import marker.
+      this.db
+        .prepare(
+          `UPDATE runs SET imported = 1 WHERE imported = 0 AND trace_id IN (
+             SELECT s.trace_id FROM spans s JOIN resources r ON r.id = s.resource_id
+             WHERE EXISTS (SELECT 1 FROM json_each(json_extract(r.json, '$.attributes')) a
+                           WHERE json_extract(a.value, '$.key') = 'neatroots.import.source'))`,
+        )
+        .run();
+    }
     // Tool-result labels recorded before the rename to neatroots.
     this.db.prepare("UPDATE decisions SET check_id = 'neatroots.tool-result' WHERE check_id IN ('bolts.tool-result', 'neatbolt.tool-result')").run();
     this.db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')").run();
@@ -1305,7 +1317,7 @@ export class Store {
     if (Number.isFinite(maxAgeDays) && maxAgeDays >= 1) {
       const cutoff = Date.now() - maxAgeDays * 86_400_000;
       const old = this.db
-        .prepare("SELECT trace_id FROM runs WHERE pinned = 0 AND COALESCE(ended_ms, received_ms) < ? AND (imported = 0 OR received_ms < ?)")
+        .prepare("SELECT trace_id FROM runs WHERE pinned = 0 AND ((imported = 0 AND COALESCE(ended_ms, received_ms) < ?) OR (imported = 1 AND received_ms < ?))")
         .all(cutoff, cutoff) as { trace_id: string }[];
       this.deleteRuns(old.map((r) => r.trace_id));
       removed += old.length;
