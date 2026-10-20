@@ -1,4 +1,4 @@
-import type { ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 
 /**
  * Reads a CLI child's stdout as JSON lines and keeps the last 4,000 characters of stderr.
@@ -29,4 +29,16 @@ export function pipeChild(child: ChildProcess, opts: { active: () => boolean; on
     stderr = (stderr + chunk).slice(-4000);
   });
   return () => stderr;
+}
+
+/**
+ * Starts an agent CLI in its own process group. spawn() can throw before any child exists
+ * (E2BIG on an oversized prompt), so a failure comes back as its message for the caller to end the turn.
+ */
+export function launchAgent(bin: string, args: string[], cwd: string, port: number): ChildProcess | string {
+  try {
+    return spawn(bin, args, { cwd, env: { ...process.env, NEATLOGS_ENDPOINT: `http://localhost:${port}` }, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
 }

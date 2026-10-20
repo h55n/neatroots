@@ -403,3 +403,23 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"ok","sessi
     expect(denied()).toEqual([]);
   });
 });
+
+describe.skipIf(process.platform === "win32")("a chat whose agent cannot be started", () => {
+  it("ends in error instead of staying running when spawn throws, and takes the next message", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "neatroots-chat-"));
+    process.env.HOME = dir;
+    process.env.NEATROOTS_CODEX_BIN = script(
+      "codex",
+      `echo '{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"OK"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'`,
+    );
+    t = await makeRoots({ noEngine: true });
+    const s = t.roots.chats.create({ agent: "codex", cwd: dir });
+    // One argument over the OS limit (128 KiB on Linux) makes spawn throw E2BIG synchronously.
+    await t.roots.chats.send(s.id, "x".repeat(3_000_000));
+    expect(t.roots.chats.get(s.id)?.state).toBe("error");
+    expect(t.roots.chats.events(s.id).some((e) => e.kind === "error")).toBe(true);
+    await t.roots.chats.send(s.id, "hi");
+    expect(t.roots.chats.get(s.id)?.state).toBe("idle");
+  });
+});
