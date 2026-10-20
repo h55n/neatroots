@@ -39,6 +39,12 @@ describe("decision model", () => {
     expect(parseJevAnswer(q, { probabilities: { no: 0.3 } }).probability).toBeCloseTo(0.7);
     // A map with no yes or no key is ignored, so the scalar fields still apply.
     expect(parseJevAnswer(q, { noul: 0.8, probabilities: { maybe: 0.5 } }).probability).toBeCloseTo(0.8);
+    // Malformed entries are ignored, so the scalar fields still apply (and an empty array never reads as 0).
+    expect(parseJevAnswer(q, { noul: 0.8, probabilities: { yes: -1, no: Number.NaN } }).probability).toBeCloseTo(0.8);
+    expect(parseJevAnswer(q, { noul: 0.8, probabilities: { yes: 2 } }).probability).toBeCloseTo(0.8);
+    expect(parseJevAnswer(q, { noul: 0.8, probabilities: [] }).probability).toBeCloseTo(0.8);
+    // Two-sided weights above 1 are kept and normalized.
+    expect(parseJevAnswer(q, { probabilities: { yes: 3, no: 1 } }).probability).toBeCloseTo(0.75);
     // Nothing usable at all still reads as 0.
     expect(parseJevAnswer(q, {}).probability).toBe(0);
   });
