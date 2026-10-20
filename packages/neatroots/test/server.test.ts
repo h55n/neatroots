@@ -392,8 +392,9 @@ describe("server", () => {
         const j = tb.roots.imports.get(id);
         return j && j.state !== "running" ? j : undefined;
       });
-      expect(job).toMatchObject({ state: "succeeded", traces: 1, failed: 0 });
-      expect(seen.some((u) => u.startsWith(`/api/v1/public/traces/${t}/export`))).toBe(true);
+      // t was captured here, so the import keeps the local run instead of fetching Cloud's copy.
+      expect(job).toMatchObject({ state: "succeeded", traces: 0, skipped: 1, failed: 0 });
+      expect(seen.some((u) => u.startsWith(`/api/v1/public/traces/${t}/export`))).toBe(false);
     } finally {
       for (const [k, v] of Object.entries(saved)) {
         if (v === undefined) delete process.env[k];
@@ -450,6 +451,26 @@ describe("server", () => {
     expect(tb.roots.config.steering.enabled).toBe(true);
     expect(tb.roots.config.classifier.jevCloud.enabled).toBe(true);
     expect(tb.roots.config.classifier.laya.enabled).toBe(true);
+  });
+
+  it("refuses non-string or non-boolean external LLM fields instead of a 500 or a silent enable", async () => {
+    const tb = await served();
+    const headers = { "content-type": "application/json", origin: tb.url.replace("127.0.0.1", "localhost") };
+    const put = (b: unknown) => fetch(`${tb.url}/api/llm/external`, { method: "POST", headers, body: JSON.stringify(b) });
+    const before = { ...tb.roots.config.llm.external };
+    for (const [field, value, message] of [
+      ["model", 123, "model must be a string"],
+      ["base_url", 123, "base_url must be a string"],
+      ["enabled", "false", "enabled must be a boolean"],
+      ["fallback_to_local", "false", "fallback_to_local must be a boolean"],
+    ] as const) {
+      const r = await put({ [field]: value }); // was a 500 for model/base_url, and a silent enable for the string booleans
+      expect(r.status, field).toBe(400);
+      expect(((await r.json()) as { error: string }).error).toBe(message);
+    }
+    expect(tb.roots.config.llm.external).toEqual(before);
+    expect((await put({ model: "m", fallback_to_local: true })).status).toBe(200);
+    expect(tb.roots.config.llm.external).toMatchObject({ model: "m", fallbackToLocal: true });
   });
 
   it("clamps the findings list limit instead of failing on a bad value", async () => {
@@ -509,6 +530,21 @@ describe("server", () => {
     });
     expect(r.status).toBe(400);
     expect(await r.json()).toEqual({ error: "text is required" });
+  });
+
+  it("requires boolean permissions when creating a coding-agent chat", async () => {
+    const tb = await served();
+    const headers = { "content-type": "application/json", origin: tb.url.replace("127.0.0.1", "localhost") };
+    for (const field of ["allow_edits", "allow_commands"] as const) {
+      const r = await fetch(`${tb.url}/api/chat/sessions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ agent: "codex", cwd: os.tmpdir(), [field]: "false" }),
+      });
+      expect(r.status).toBe(400);
+      expect(await r.json()).toEqual({ error: `${field} must be a boolean` });
+    }
+    expect(tb.roots.chats.list()).toEqual([]);
   });
 
   it("returns 404 JSON for unknown /api and /v1 routes, not the SPA", async () => {
