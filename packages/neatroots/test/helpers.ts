@@ -9,6 +9,7 @@ import { Roots } from "../src/core.js";
 import { defaultConfig, type RootsConfig } from "../src/config.js";
 import { createApp, startServer } from "../src/server/app.js";
 import type { KeyValue, OtlpSpan, ResourceSpansBatch } from "../src/otlp/types.js";
+import { Store } from "../src/store/db.js";
 import { setQuiet } from "../src/util/log.js";
 
 setQuiet(true);
@@ -19,6 +20,19 @@ if (!process.env.NEATROOTS_HOME?.includes("neatroots-test-")) process.env.NEATRO
 
 export function tmpHome(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "neatroots-test-"));
+}
+
+const trackedStores = new Set<Store>();
+
+export function trackedStore(dir: string): Store {
+  const store = new Store(dir);
+  trackedStores.add(store);
+  return store;
+}
+
+export function closeTrackedStores(): void {
+  for (const store of trackedStores) if (store.db.open) store.close();
+  trackedStores.clear();
 }
 
 export async function freePort(): Promise<number> {
@@ -101,7 +115,7 @@ export function batch(spans: OtlpSpan[], service = "test-agent", scope = "neatlo
   };
 }
 
-export function llmSpan(traceId: string, parent: string, opts: { system?: string; user: string; out?: string; toolCalls?: { name: string; args: string }[]; tools?: string[] }): OtlpSpan {
+export function llmSpan(traceId: string, parent: string, opts: { system?: string; user: string; out?: string; toolCalls?: { name: string; args: string }[]; tools?: string[]; attrs?: KeyValue[] }): OtlpSpan {
   const attrs: KeyValue[] = [s("neatlogs.llm.model_name", "mock"), s("neatlogs.llm.token_count.prompt", "10"), s("neatlogs.llm.token_count.completion", "5"), s("neatlogs.llm.token_count.total", "15")];
   let i = 0;
   if (opts.system) {
@@ -112,6 +126,7 @@ export function llmSpan(traceId: string, parent: string, opts: { system?: string
   if (opts.out !== undefined) attrs.push(s("neatlogs.llm.output_messages.0.role", "assistant"), s("neatlogs.llm.output_messages.0.content", opts.out));
   (opts.toolCalls ?? []).forEach((c, j) => attrs.push(s(`neatlogs.llm.tool_calls.${j}.name`, c.name), s(`neatlogs.llm.tool_calls.${j}.arguments`, c.args)));
   (opts.tools ?? []).forEach((t, j) => attrs.push(s(`neatlogs.llm.tools.${j}.name`, t)));
+  attrs.push(...(opts.attrs ?? []));
   return span({ traceId, parent, name: "openai.chat.completions.create", kind: "llm", attrs });
 }
 

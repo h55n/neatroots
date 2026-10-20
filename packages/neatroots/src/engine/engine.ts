@@ -10,6 +10,7 @@ import type { SteeringHub } from "../steering/hub.js";
 import {
   buildEvidence,
   describeSpan,
+  type BuiltEvidence,
   finalOutput,
   loadTrace,
   matchesSelector,
@@ -53,8 +54,19 @@ const TRIAGE_LEVELS = [
 /** With the LLM standing in for a classifier, a span-scope question is asked about at most this many spans per run. */
 const SLOW_SPAN_CHECKS_PER_RUN = 4;
 
+/**
+ * How long a live requires_before rule waits for a late prerequisite span (another exporter's
+ * batch) before it raises. Shorter than the 300 ms gate wait, so a halt still reaches the next call.
+ */
+const RULE_GRACE_MS = 250;
+
 /** Triage at or above this expected level gets an LLM investigation. */
 const INVESTIGATE_AT = 2.5;
+
+/** A session question is judged over at most this many earlier runs of the session (the newest ones). */
+const SESSION_RUN_LOOKBACK = 25;
+const SESSION_EARLIER_SPANS = 6;
+const SESSION_EARLIER_BUDGET = 2000;
 
 interface LiveRun {
   traceId: string;
@@ -69,12 +81,16 @@ interface LiveRun {
   spanQueue: Map<string, string[]>;
   spanBusy: Set<string>;
   spanAsked: Map<string, number>;
+  /** Per span-scope check: spans whose model call failed live; run end asks them once more. */
+  retrySpans: Map<string, Set<string>>;
   /** Per question: flags the second look turned down; after a few, the question stops raising. */
   rejected: Map<string, number>;
   traceEvidence: Map<string, string>;
   dirty: Set<string>;
   debounce?: NodeJS.Timeout;
   endTimer?: NodeJS.Timeout;
+  /** Rules waiting out RULE_GRACE_MS before raising: false while waiting, true once it is up. */
+  ruleGrace: Map<string, boolean>;
   ended: boolean;
   endHandled: boolean;
   doctor: boolean;
@@ -121,6 +137,27 @@ export function flagged(c: QuestionCheck, r: DecisionResult): { flagged: boolean
  * model. The local LLM is called only to plan, investigate when triage says it is worth
  * it, write notes for the agent and summarize, within per-run budgets.
  */
+/** Thrown when a span id given to judge matches no span, or more than one, in the run. */
+export class UnknownSpanError extends Error {}
+
+/**
+ * The spans named by ids or unique prefixes (any case), in run order. An id that matches nothing or
+ * more than one span throws, so a question is never judged over less evidence than was asked for.
+ */
+function pickSpans<S extends { id: string }>(spans: S[], ids: string[], traceId: string): S[] {
+  const picked = new Set<string>();
+  for (const raw of ids) {
+    const id = String(raw ?? "").trim().toLowerCase();
+    if (!id) throw new UnknownSpanError(`an empty span id was given for run ${traceId}`);
+    const exact = spans.find((s) => s.id === id);
+    const hits = exact ? [exact] : spans.filter((s) => s.id.startsWith(id));
+    if (!hits.length) throw new UnknownSpanError(`no span ${raw} in run ${traceId}`);
+    if (hits.length > 1) throw new UnknownSpanError(`span id ${raw} matches more than one span in run ${traceId}; use more characters`);
+    picked.add(hits[0].id);
+  }
+  return spans.filter((s) => picked.has(s.id));
+}
+
 export class Engine {
   private live = new Map<string, LiveRun>();
   private workflowPlanning = new Map<string, Promise<PlanRow | undefined>>();
@@ -175,12 +212,24 @@ export class Engine {
   waitIdle(traceId: string, timeoutMs: number): Promise<boolean> {
     if (!this.pending(traceId)) return Promise.resolve(true);
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(false), timeoutMs);
-      const list = this.idleWaiters.get(traceId) ?? [];
-      list.push(() => {
+      let cb: (() => void) | undefined;
+      const timer = setTimeout(() => {
+        if (cb) {
+          const list = this.idleWaiters.get(traceId);
+          if (list) {
+            const idx = list.indexOf(cb);
+            if (idx >= 0) list.splice(idx, 1);
+            if (!list.length) this.idleWaiters.delete(traceId);
+          }
+        }
+        resolve(false);
+      }, timeoutMs);
+      cb = () => {
         clearTimeout(timer);
         resolve(true);
-      });
+      };
+      const list = this.idleWaiters.get(traceId) ?? [];
+      list.push(cb);
       this.idleWaiters.set(traceId, list);
       const run = this.live.get(traceId);
       if (run?.dirty.size) this.scheduleFlush(run);
@@ -214,9 +263,11 @@ export class Engine {
       spanQueue: new Map(),
       spanBusy: new Set(),
       spanAsked: new Map(),
+      retrySpans: new Map(),
       rejected: new Map(),
       traceEvidence: new Map(),
       dirty: new Set(),
+      ruleGrace: new Map(),
       ended: false,
       endHandled: false,
       doctor: row.doctor === 1,
@@ -285,7 +336,8 @@ export class Engine {
 
   private scheduleQuestions(run: LiveRun, snap: TraceSnapshot, fresh: SpanInfo[]): void {
     for (const { check, params } of this.questionsFor(run)) {
-      if (check.when === "end") continue;
+      // Session questions judge across runs, so they only run at run end, never live.
+      if (check.when === "end" || check.scope === "session") continue;
       const sel = check.evidence?.spans;
       if (check.scope === "span") {
         const queue = run.spanQueue.get(check.id) ?? [];
@@ -340,6 +392,22 @@ export class Engine {
     }
   }
 
+  /** One more try for spans whose model call failed live, still within the slow-mode cap on attempts. */
+  private async retryFailedSpans(run: LiveRun, check: QuestionCheck, params: Record<string, string>): Promise<void> {
+    const retry = run.retrySpans.get(check.id);
+    if (!retry?.size) return;
+    run.retrySpans.delete(check.id);
+    const slow = await this.decisions.isSlow([toQuestion(check, params)]);
+    for (const spanId of retry) {
+      if (slow) {
+        const asked = run.spanAsked.get(check.id) ?? 0;
+        if (asked >= SLOW_SPAN_CHECKS_PER_RUN) break;
+        run.spanAsked.set(check.id, asked + 1);
+      }
+      await this.askSpan(run, check, params, spanId);
+    }
+  }
+
   private async flushDirty(run: LiveRun): Promise<void> {
     const ids = [...run.dirty];
     run.dirty.clear();
@@ -359,12 +427,14 @@ export class Engine {
       if (rule.rule.type === "run_end" && !atEnd) continue;
       let hit: RuleHit | null;
       try {
-        hit = evaluateRule(rule, snap, atEnd, fresh);
+        hit = evaluateRule(rule, snap, atEnd, fresh, lc.source !== "library");
       } catch (err) {
         log.warn(`rule ${rule.id} failed: ${(err as Error).message}`);
         continue;
       }
       const open = this.roots.store.openFindingFor(run.traceId, rule.id);
+      if (!hit?.firing) run.ruleGrace.delete(rule.id);
+      else if (!open && !atEnd && rule.rule.type === "requires_before" && this.waitForLateSpans(run, rule.id)) continue;
       if (hit?.firing) {
         if (open) {
           const changed = JSON.stringify(open.evidence_span_ids) !== JSON.stringify(hit.evidenceSpanIds);
@@ -391,15 +461,40 @@ export class Engine {
           if (status === "raised") this.onFindingRaised(run, f, lc, hit.params, snap);
         }
       } else if (open && hit && !hit.firing) {
-        this.resolve(open);
+        // A streak that ended still happened, so its halt stands. A requires_before whose earlier
+        // call arrived late never happened at all, so its halt is withdrawn too.
+        this.resolve(open, { keepHalts: rule.rule.type !== "requires_before" });
       }
     }
   }
 
-  private resolve(f: Finding): void {
+  /**
+   * True while a rule should hold off raising. The first time it would raise, starts a short
+   * wait (tracked, so gate-mode claims wait for it) and checks the rules again afterwards.
+   */
+  private waitForLateSpans(run: LiveRun, ruleId: string): boolean {
+    const due = run.ruleGrace.get(ruleId);
+    if (due) {
+      run.ruleGrace.delete(ruleId);
+      return false;
+    }
+    if (due === undefined) {
+      run.ruleGrace.set(ruleId, false);
+      const recheck = new Promise((r) => setTimeout(r, RULE_GRACE_MS)).then(() => {
+        if (!run.ruleGrace.has(ruleId)) return;
+        run.ruleGrace.set(ruleId, true);
+        // At run end the rules are applied without waiting, so there is nothing left to do.
+        if (!run.endHandled) this.applyRules(run, loadTrace(this.roots.store, run.traceId), false);
+      });
+      void this.track(run.traceId, recheck);
+    }
+    return true;
+  }
+
+  private resolve(f: Finding, opts: { keepHalts?: boolean } = { keepHalts: true }): void {
     const next = this.roots.store.updateFinding(f.id, { status: "resolved" });
-    // The agent moving on doesn't undo a halt the user's rule asked for.
-    this.steering.withdraw(f.id, { keepHalts: true });
+    // By default the agent moving on doesn't undo a halt the user's rule asked for.
+    this.steering.withdraw(f.id, opts);
     if (next) this.roots.bus.emit("finding", next);
   }
 
@@ -410,7 +505,13 @@ export class Engine {
     const span = snap.spans.find((s) => s.id === spanId);
     if (!span) return;
     const ev = buildEvidence(snap, check.evidence, { focus: span });
-    await this.decideAndApply(run, check, params, ev.text, ev.spanIds, snap, spanId);
+    const outcome = await this.decideAndApply(run, check, params, ev.text, ev.spanIds, snap, spanId);
+    // The model call failed (a timeout or dropped connection lands here too): run end tries once more.
+    if (outcome === "unavailable" && !run.endHandled) {
+      const retry = run.retrySpans.get(check.id) ?? new Set<string>();
+      retry.add(spanId);
+      run.retrySpans.set(check.id, retry);
+    }
   }
 
   private async askTrace(run: LiveRun, check: QuestionCheck, params: Record<string, string>, snap: TraceSnapshot): Promise<void> {
@@ -420,7 +521,69 @@ export class Engine {
     const key = ev.spanIds.join(",") + (check.evidence?.final_output ? `|${finalOutput(snap) ?? ""}` : "");
     if (run.traceEvidence.get(check.id) === key) return;
     run.traceEvidence.set(check.id, key);
-    await this.decideAndApply(run, check, params, ev.text, ev.spanIds, snap, null);
+    const outcome = await this.decideAndApply(run, check, params, ev.text, ev.spanIds, snap, null);
+    // Not asked after all, so the run-end pass asks again; unless an overlapping pass cached newer evidence.
+    if (outcome === "unavailable" && run.traceEvidence.get(check.id) === key) run.traceEvidence.delete(check.id);
+  }
+
+  /** The session's earlier runs' spans, oldest run first, read run by run (bounded to the newest
+   * SESSION_RUN_LOOKBACK finished runs). Span ids can repeat across traces, so they are never used to
+   * tell a run's spans from the current run's. */
+  private sessionEarlierSpans(traceId: string, snap: TraceSnapshot): SpanInfo[] {
+    const sessionId = snap.run?.session_id;
+    if (!sessionId) return [];
+    // Only turns that started before this run: rechecking an older run must not see the future.
+    const startedMs = snap.run?.started_ms;
+    // Running turns are excluded in the query, so they can't push finished ones out of the limit.
+    const earlier = this.roots.store
+      .listRuns({ sessionId, excludeStatus: "running", limit: SESSION_RUN_LOOKBACK + 1, ...(startedMs ? { untilMs: startedMs - 1 } : {}) })
+      .filter((r) => r.trace_id !== traceId)
+      .reverse();
+    const spans: SpanInfo[] = [];
+    for (const r of earlier) spans.push(...loadTrace(this.roots.store, r.trace_id).spans);
+    return spans;
+  }
+
+  /** Evidence for a session question: the run in hand under the usual limits, plus a bounded tail of
+   * the earlier turns' spans. `evidence.last` over a merged list would let a busy current run crowd
+   * the earlier turns out, and those turns are the point of a session question. */
+  private sessionEvidence(check: QuestionCheck, snap: TraceSnapshot): BuiltEvidence & { ownSpanIds: string[] } {
+    const earlierSpans = this.sessionEarlierSpans(snap.traceId, snap);
+    const own = buildEvidence(snap, { ...check.evidence, final_output: false });
+    const ev = { ...own, ownSpanIds: [...own.spanIds] };
+    if (earlierSpans.length) {
+      const earlier = buildEvidence(
+        { traceId: snap.traceId, run: snap.run, spans: earlierSpans },
+        { spans: check.evidence?.spans, fields: check.evidence?.fields, last: SESSION_EARLIER_SPANS, goal: false },
+        { budget: SESSION_EARLIER_BUDGET },
+      );
+      if (earlier.spanIds.length) {
+        ev.text = `Earlier turns in this session:\n${earlier.text}\n\nCurrent run:\n${ev.text}`;
+        ev.spanIds = [...earlier.spanIds, ...ev.spanIds];
+      }
+    }
+    return ev;
+  }
+
+  /** A session question is judged at each run's end over the session's spans so far, oldest first.
+   * The finding pins to the run in hand (findings are per trace), with evidence from that run. */
+  private async askSession(run: LiveRun, check: QuestionCheck, params: Record<string, string>, snap: TraceSnapshot): Promise<void> {
+    // The final answer must be this run's: the merged spans' first root is the session's oldest turn.
+    const ev = this.sessionEvidence(check, snap);
+    if (check.evidence?.final_output) {
+      const out = finalOutput(snap);
+      if (out) ev.text += `\n\nFinal answer (this run): ${clip(out, 1500)}`;
+    }
+    // Ask only when this run has something to judge: a finding pins to this run's spans, so earlier
+    // turns alone would raise one with empty evidence_span_ids.
+    if (!ev.ownSpanIds.length && !(check.evidence?.final_output && finalOutput(snap))) return;
+    const key = ev.spanIds.join(",") + (check.evidence?.final_output ? `|${finalOutput(snap) ?? ""}` : "");
+    if (run.traceEvidence.get(check.id) === key) return;
+    run.traceEvidence.set(check.id, key);
+    const pinIds = ev.ownSpanIds;
+    const outcome = await this.decideAndApply(run, check, params, ev.text, pinIds, snap, null);
+    // Not asked after all, so the run-end pass asks again; unless an overlapping pass cached newer evidence.
+    if (outcome === "unavailable" && run.traceEvidence.get(check.id) === key) run.traceEvidence.delete(check.id);
   }
 
   private async decideAndApply(
@@ -431,7 +594,7 @@ export class Engine {
     spanIds: string[],
     snap: TraceSnapshot,
     spanId: string | null,
-  ): Promise<void> {
+  ): Promise<"unavailable" | void> {
     let result: DecisionResult;
     try {
       result = await this.decisions.decide(evidence, [toQuestion(check, params)]);
@@ -440,7 +603,7 @@ export class Engine {
       if (err instanceof DecisionUnavailableError || err instanceof LlmUnavailableError) {
         if (!this.decisionDown) log.warn(`questions skipped: ${(err as Error).message}`);
         this.decisionDown = true;
-        return;
+        return "unavailable";
       }
       // A model error or timeout is a failed check, never a "no".
       const existing = this.roots.store.latestFindingFor(run.traceId, check.id);
@@ -885,7 +1048,7 @@ ${library}`;
         id,
         kind: "yes_no",
         title: clip(q.ask, 80),
-        scope: q.scope === "span" ? "span" : "trace",
+        scope: q.scope === "span" ? "span" : q.scope === "session" ? "session" : "trace",
         ask: q.ask,
         evidence: { spans: { type: types }, fields: ["input", "output", "status", "error"], last: q.scope === "span" ? undefined : 12 },
         flag_at: 0.8,
@@ -942,6 +1105,9 @@ ${library}`;
         }
         run.spanQueue.set(check.id, queue);
         await this.drainSpanQueue(run, check, params);
+        await this.retryFailedSpans(run, check, params);
+      } else if (check.scope === "session") {
+        await this.askSession(run, check, params, snap);
       } else {
         await this.askTrace(run, check, params, snap);
       }
@@ -1047,7 +1213,7 @@ ${library}`;
     let text: string;
     let spanIds: string[];
     if (opts.spanIds?.length) {
-      const spans = snap.spans.filter((s) => opts.spanIds!.includes(s.id) || opts.spanIds!.some((id) => s.id.startsWith(id)));
+      const spans = pickSpans(snap.spans, opts.spanIds, traceId);
       const g = runGoal(snap);
       text = [g.user ? `User request: ${clip(g.user, 600)}` : "", "Spans:", ...spans.map((s) => describeSpan(s, ["input", "output", "status", "error"]))].filter(Boolean).join("\n");
       spanIds = spans.map((s) => s.id);
@@ -1067,7 +1233,29 @@ ${library}`;
     total: number;
     truncated: boolean;
   }> {
-    const runs = this.roots.store.listRuns({ workflow: opts.workflow, project: opts.project, limit: opts.limit ?? 50 }).filter((r) => r.status !== "running");
+    const limit = opts.limit ?? 50;
+    const sessionQ = !isRule(check) && check.scope === "session";
+    // Only runs the check would watch: the engine skips runs outside its applies_to, so a preview
+    // over them would report hits the check can never raise. Look further back to still fill `limit`.
+    const eligible = this.roots.store
+      .listRuns({ workflow: opts.workflow, project: opts.project, limit: check.applies_to || sessionQ ? 500 : limit })
+      .filter((r) => r.status !== "running")
+      .filter((r) => this.appliesTo(check, { project: r.project ?? "unknown", workflow: r.workflow ?? r.project ?? "unknown" }));
+    // A session question is previewed once per session, on its newest run: pick distinct sessions
+    // before the limit, so one chatty session can't crowd the others out of the window.
+    const runs: typeof eligible = [];
+    if (sessionQ) {
+      const seen = new Set<string>();
+      for (const r of eligible) {
+        const sid = r.session_id ?? r.trace_id;
+        if (seen.has(sid)) continue;
+        seen.add(sid);
+        runs.push(r);
+        if (runs.length >= limit) break;
+      }
+    } else {
+      runs.push(...eligible.slice(0, limit));
+    }
     const deadline = Date.now() + (opts.timeBudgetMs ?? 90_000);
     const hits: { trace_id: string; probability: number | null; evidence_span_ids: string[]; root_name: string | null }[] = [];
     let checked = 0;
@@ -1076,20 +1264,27 @@ ${library}`;
       const snap = loadTrace(this.roots.store, r.trace_id);
       checked++;
       if (isRule(check)) {
-        const hit = evaluateRule(check, snap, true);
+        // A previewed check is a draft someone (or a coding agent) wrote, so its pattern is timed.
+        const hit = evaluateRule(check, snap, true, undefined, true);
         if (hit) hits.push({ trace_id: r.trace_id, probability: null, evidence_span_ids: hit.evidenceSpanIds, root_name: r.root_name });
         continue;
       }
       const targets = check.scope === "span" ? selectSpans(snap.spans, check.evidence?.spans).slice(-5) : [undefined];
       for (const focus of targets) {
-        const ev = buildEvidence(snap, check.evidence, { focus });
-        if (!ev.spanIds.length && !check.evidence?.final_output) continue;
+        // The final answer must be this run's: the merged session spans' first root is the oldest turn.
+        const sess = !isRule(check) && check.scope === "session" ? this.sessionEvidence(check, snap) : undefined;
+        const ev = sess ?? buildEvidence(snap, check.evidence, { focus });
+        if (check.scope === "session" && check.evidence?.final_output) {
+          const out = finalOutput(snap);
+          if (out) ev.text += `\n\nFinal answer (this run): ${clip(out, 1500)}`;
+        }
+        if (sess ? !sess.ownSpanIds.length && !(check.evidence?.final_output && finalOutput(snap)) : !ev.spanIds.length && !check.evidence?.final_output) continue;
         try {
           if (opts.signal?.aborted) break;
           const res = await this.decisions.decide(ev.text, [toQuestion(check, check.params ?? {})], { priority: "interactive", signal: opts.signal });
           const v = flagged(check, res);
           if (v.flagged) {
-            hits.push({ trace_id: r.trace_id, probability: v.probability, evidence_span_ids: ev.spanIds, root_name: r.root_name });
+            hits.push({ trace_id: r.trace_id, probability: v.probability, evidence_span_ids: sess ? sess.ownSpanIds : ev.spanIds, root_name: r.root_name });
             break;
           }
         } catch (err) {
