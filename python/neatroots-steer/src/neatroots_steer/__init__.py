@@ -20,11 +20,13 @@ Steering is opt-in per project in neatroots (neatroots steering advisory --proje
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import functools
 import inspect
 import logging
 import os
+import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ._client import RootsClient, Note, configure, get_client
@@ -47,12 +49,15 @@ __all__ = [
     "replay_overrides",
 ]
 
-__version__ = "0.2.8"
+__version__ = "0.2.9"
 
 logger = logging.getLogger("neatroots_steer")
 
 GUIDANCE_OPEN = "<neatroots-guidance>"
 GUIDANCE_CLOSE = "</neatroots-guidance>"
+
+# How long a flush before a claim or a self-check may hold up the agent's call.
+_FLUSH_TIMEOUT_MS = 500
 
 
 class NeatrootsHalt(RuntimeError):
@@ -93,8 +98,27 @@ def current_trace() -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
+_flushing: Optional[threading.Thread] = None
+_flushing_lock = threading.Lock()
+
+
 def _flush_sdk() -> None:
-    """Pushes finished spans to neatroots now, so gate mode and self-checks see the latest step."""
+    """Pushes finished spans to neatroots now, so gate mode and self-checks see the latest step.
+
+    Waits at most _FLUSH_TIMEOUT_MS. With its collector down, the SDK's flush takes seconds
+    whatever timeout it is given, so it runs on its own thread and the agent doesn't wait for it.
+    A flush that is still running isn't started again.
+    """
+    global _flushing
+    with _flushing_lock:
+        if _flushing is None or not _flushing.is_alive():
+            _flushing = threading.Thread(target=_flush_now, name="neatroots-steer-flush", daemon=True)
+            _flushing.start()
+        flushing = _flushing
+    flushing.join(_FLUSH_TIMEOUT_MS / 1000)
+
+
+def _flush_now() -> None:
     try:
         import neatlogs  # type: ignore
 
@@ -110,7 +134,7 @@ def _flush_sdk() -> None:
         provider = trace.get_tracer_provider()
         force = getattr(provider, "force_flush", None)
         if callable(force):
-            force(500)
+            force(_FLUSH_TIMEOUT_MS)
     except Exception:  # noqa: BLE001
         pass
 
@@ -150,6 +174,10 @@ def guidance(trace_id: Optional[str] = None) -> Optional[Note]:
     Raises NeatrootsHalt when the note is a stop from one of your own halt rules.
     """
     client = get_client()
+    if client.paused():
+        # The claim would be skipped anyway; skip the flush too, so a stopped neatroots (or
+        # NEATROOTS_STEER=off) costs nothing per LLM call.
+        return None
     span_id = None
     if trace_id is None:
         trace_id, span_id = current_trace()
@@ -315,7 +343,8 @@ def _wrap_method(
 
         @functools.wraps(original)
         async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            return await original(*args, **prepare(kwargs))
+            prepared = await asyncio.to_thread(prepare, kwargs)
+            return await original(*args, **prepared)
 
         async_wrapper.__neatroots_wrapped__ = True  # type: ignore[attr-defined]
         setattr(owner, name, async_wrapper)
@@ -329,24 +358,54 @@ def _wrap_method(
         setattr(owner, name, wrapper)
 
 
+def _wrap_factory(owner: Any, name: str) -> None:
+    """Wrap a method that builds a new client (``with_options``, ``copy``) so the copy is wrapped too."""
+    original = getattr(owner, name, None)
+    if original is None or getattr(original, "__neatroots_wrapped__", False):
+        return
+
+    @functools.wraps(original)
+    def factory(*args: Any, **kwargs: Any) -> Any:
+        return wrap(original(*args, **kwargs))
+
+    factory.__neatroots_wrapped__ = True  # type: ignore[attr-defined]
+    setattr(owner, name, factory)
+
+
 def wrap(client: Any) -> Any:
     """Adds neatroots guidance to an OpenAI or Anthropic client (sync or async), in place, and returns it.
 
     During a neatroots replay it also applies the model and system prompt the replay asked for.
 
-    Covers chat.completions.create, responses.create (OpenAI) and messages.create (Anthropic).
+    Covers chat.completions.create/parse and responses.create/parse (OpenAI) and
+    messages.create/stream/parse (Anthropic), plus the client that ``with_options`` or ``copy``
+    returns. OpenAI's ``stream()`` goes through ``create``, so it is not wrapped on its own.
     Wrap the client you pass to your agent; tracing by the Neatlogs SDK still records the call.
     """
     chat = getattr(client, "chat", None)
     completions = getattr(chat, "completions", None) if chat is not None else None
+    recognized = False
     if completions is not None:
-        _wrap_method(completions, "create", lambda kw, note: {**kw, "messages": apply(list(kw.get("messages") or []), note)}, _override_chat)
+        recognized = True
+        apply_chat = lambda kw, note: {**kw, "messages": apply(list(kw.get("messages") or []), note)}  # noqa: E731
+        _wrap_method(completions, "create", apply_chat, _override_chat)
+        _wrap_method(completions, "parse", apply_chat, _override_chat)
     responses = getattr(client, "responses", None)
     if responses is not None and hasattr(responses, "create"):
-        _wrap_method(responses, "create", lambda kw, note: {**kw, "input": _apply_responses_input(kw.get("input"), note)}, _override_responses)
+        recognized = True
+        apply_responses = lambda kw, note: {**kw, "input": _apply_responses_input(kw.get("input"), note)}  # noqa: E731
+        _wrap_method(responses, "create", apply_responses, _override_responses)
+        _wrap_method(responses, "parse", apply_responses, _override_responses)
     messages = getattr(client, "messages", None)
     if messages is not None and hasattr(messages, "create") and completions is None:
-        _wrap_method(messages, "create", lambda kw, note: {**kw, "messages": apply_anthropic(copy.copy(list(kw.get("messages") or [])), note)}, _override_anthropic)
+        recognized = True
+        apply_messages = lambda kw, note: {**kw, "messages": apply_anthropic(copy.copy(list(kw.get("messages") or [])), note)}  # noqa: E731
+        _wrap_method(messages, "create", apply_messages, _override_anthropic)
+        _wrap_method(messages, "stream", apply_messages, _override_anthropic)
+        _wrap_method(messages, "parse", apply_messages, _override_anthropic)
+    if recognized:
+        _wrap_factory(client, "with_options")
+        _wrap_factory(client, "copy")
     return client
 
 
@@ -384,8 +443,11 @@ def check_my_work(question: str, *, trace_id: Optional[str] = None, timeout: flo
         trace_id, _ = current_trace()
     if not trace_id:
         return {"answer": "unknown", "probability_yes": None, "reason": "no active trace; is the Neatlogs SDK initialized?"}
-    _flush_sdk()
-    res = get_client().check(trace_id, question, timeout=timeout)
+    client = get_client()
+    res = None
+    if not client.paused():
+        _flush_sdk()
+        res = client.check(trace_id, question, timeout=timeout)
     if res is None:
         return {"answer": "unknown", "probability_yes": None, "reason": "neatroots is not reachable"}
     return {
