@@ -196,9 +196,13 @@ export class JevBackend implements DecisionBackend {
 export function parseJevAnswer(q: DecisionQuestion, a: Record<string, unknown>): DecisionAnswer {
   const probs = (a.probabilities ?? a.distribution ?? a.scores) as Record<string, number> | number[] | undefined;
   if (q.type === "yes_no") {
-    // Servers differ in which probability fields they include: read a distribution first,
-    // like the choice and score branches do, before the scalar fields.
-    if (probs && !Array.isArray(probs)) return answerFromDistribution(q, { yes: probs.yes ?? 0, no: probs.no ?? 0 });
+    // Servers differ in which probability fields they include: read a yes/no distribution
+    // first, but only when it has a yes or no key, so other maps fall through to the scalars.
+    if (probs && !Array.isArray(probs) && (typeof probs.yes === "number" || typeof probs.no === "number")) {
+      const yes = typeof probs.yes === "number" ? probs.yes : 1 - (probs.no as number);
+      const no = typeof probs.no === "number" ? probs.no : 1 - yes;
+      return answerFromDistribution(q, { yes, no });
+    }
     if (Array.isArray(probs)) return answerFromDistribution(q, { yes: probs[0] ?? 0, no: probs[1] ?? 0 });
     const p = typeof a.noul === "number" ? a.noul : typeof a.probability === "number" ? a.probability : typeof a.boolean === "number" ? a.boolean : 0;
     return answerFromDistribution(q, { yes: p, no: 1 - p });
