@@ -43,6 +43,9 @@ describe("decision model", () => {
     expect(parseJevAnswer(q, { noul: 0.8, probabilities: { yes: -1, no: Number.NaN } }).probability).toBeCloseTo(0.8);
     expect(parseJevAnswer(q, { noul: 0.8, probabilities: { yes: 2 } }).probability).toBeCloseTo(0.8);
     expect(parseJevAnswer(q, { noul: 0.8, probabilities: [] }).probability).toBeCloseTo(0.8);
+    // A zero-total map or array carries no answer, so the scalar fields apply.
+    expect(parseJevAnswer(q, { noul: 0.9, probabilities: { yes: 0, no: 0 } }).probability).toBeCloseTo(0.9);
+    expect(parseJevAnswer(q, { noul: 0.9, scores: [0, 0] }).probability).toBeCloseTo(0.9);
     // Two-sided weights above 1 are kept and normalized.
     expect(parseJevAnswer(q, { probabilities: { yes: 3, no: 1 } }).probability).toBeCloseTo(0.75);
     // Nothing usable at all still reads as 0.

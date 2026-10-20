@@ -202,12 +202,14 @@ export function parseJevAnswer(q: DecisionQuestion, a: Record<string, unknown>):
     const weight = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
     if (probs && !Array.isArray(probs)) {
       const { yes, no } = probs;
-      if (weight(yes) && weight(no)) return answerFromDistribution(q, { yes, no });
+      if (weight(yes) && weight(no) && yes + no > 0) return answerFromDistribution(q, { yes, no });
       // One side only: the other is 1 - p, which needs p to be a probability.
-      if (weight(yes) && yes <= 1) return answerFromDistribution(q, { yes, no: 1 - yes });
-      if (weight(no) && no <= 1) return answerFromDistribution(q, { yes: 1 - no, no });
+      if (!(weight(yes) && weight(no))) {
+        if (weight(yes) && yes <= 1) return answerFromDistribution(q, { yes, no: 1 - yes });
+        if (weight(no) && no <= 1) return answerFromDistribution(q, { yes: 1 - no, no });
+      }
     }
-    if (Array.isArray(probs) && weight(probs[0]) && weight(probs[1])) return answerFromDistribution(q, { yes: probs[0], no: probs[1] });
+    if (Array.isArray(probs) && weight(probs[0]) && weight(probs[1]) && probs[0] + probs[1] > 0) return answerFromDistribution(q, { yes: probs[0], no: probs[1] });
     const p = typeof a.noul === "number" ? a.noul : typeof a.probability === "number" ? a.probability : typeof a.boolean === "number" ? a.boolean : 0;
     return answerFromDistribution(q, { yes: p, no: 1 - p });
   }
