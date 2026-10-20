@@ -282,6 +282,8 @@ export interface RunFilter {
   project?: string;
   workflow?: string;
   status?: string;
+  /** Runs whose status is not this one, applied before the limit. */
+  excludeStatus?: string;
   sessionId?: string;
   hasFinding?: boolean;
   /** Runs with an open or resolved finding from this check. */
@@ -746,6 +748,10 @@ export class Store {
     if (f.status) {
       where.push("status = @status");
       p.status = f.status;
+    }
+    if (f.excludeStatus) {
+      where.push("status != @excludeStatus");
+      p.excludeStatus = f.excludeStatus;
     }
     if (f.sessionId) {
       where.push("session_id = @session");

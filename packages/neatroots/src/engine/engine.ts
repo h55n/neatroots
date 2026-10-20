@@ -526,33 +526,34 @@ export class Engine {
     if (outcome === "unavailable" && run.traceEvidence.get(check.id) === key) run.traceEvidence.delete(check.id);
   }
 
-  /** This run's snapshot with the session's earlier runs' spans prepended, oldest first (bounded). */
-  private sessionSnapshot(traceId: string, snap: TraceSnapshot): TraceSnapshot {
+  /** The session's earlier runs' spans, oldest run first, read run by run (bounded to the newest
+   * SESSION_RUN_LOOKBACK finished runs). Span ids can repeat across traces, so they are never used to
+   * tell a run's spans from the current run's. */
+  private sessionEarlierSpans(traceId: string, snap: TraceSnapshot): SpanInfo[] {
     const sessionId = snap.run?.session_id;
-    if (!sessionId) return snap;
+    if (!sessionId) return [];
     // Only turns that started before this run: rechecking an older run must not see the future.
     const startedMs = snap.run?.started_ms;
+    // Running turns are excluded in the query, so they can't push finished ones out of the limit.
     const earlier = this.roots.store
-      .listRuns({ sessionId, limit: SESSION_RUN_LOOKBACK + 1, ...(startedMs ? { untilMs: startedMs - 1 } : {}) })
-      .filter((r) => r.trace_id !== traceId && r.status !== "running")
+      .listRuns({ sessionId, excludeStatus: "running", limit: SESSION_RUN_LOOKBACK + 1, ...(startedMs ? { untilMs: startedMs - 1 } : {}) })
+      .filter((r) => r.trace_id !== traceId)
       .reverse();
-    if (!earlier.length) return snap;
     const spans: SpanInfo[] = [];
     for (const r of earlier) spans.push(...loadTrace(this.roots.store, r.trace_id).spans);
-    return { traceId, run: snap.run, spans: [...spans, ...snap.spans] };
+    return spans;
   }
 
   /** Evidence for a session question: the run in hand under the usual limits, plus a bounded tail of
-   * the earlier turns' spans. `evidence.last` over the merged list would let a busy current run crowd
+   * the earlier turns' spans. `evidence.last` over a merged list would let a busy current run crowd
    * the earlier turns out, and those turns are the point of a session question. */
-  private sessionEvidence(check: QuestionCheck, snap: TraceSnapshot): BuiltEvidence {
-    const merged = this.sessionSnapshot(snap.traceId, snap);
-    const own = new Set(snap.spans.map((s) => s.id));
-    const earlierSpans = merged.spans.filter((s) => !own.has(s.id));
-    const ev = buildEvidence(snap, { ...check.evidence, final_output: false });
+  private sessionEvidence(check: QuestionCheck, snap: TraceSnapshot): BuiltEvidence & { ownSpanIds: string[] } {
+    const earlierSpans = this.sessionEarlierSpans(snap.traceId, snap);
+    const own = buildEvidence(snap, { ...check.evidence, final_output: false });
+    const ev = { ...own, ownSpanIds: [...own.spanIds] };
     if (earlierSpans.length) {
       const earlier = buildEvidence(
-        { traceId: merged.traceId, run: merged.run, spans: earlierSpans },
+        { traceId: snap.traceId, run: snap.run, spans: earlierSpans },
         { spans: check.evidence?.spans, fields: check.evidence?.fields, last: SESSION_EARLIER_SPANS, goal: false },
         { budget: SESSION_EARLIER_BUDGET },
       );
@@ -573,12 +574,13 @@ export class Engine {
       const out = finalOutput(snap);
       if (out) ev.text += `\n\nFinal answer (this run): ${clip(out, 1500)}`;
     }
-    if (!ev.spanIds.length && !check.evidence?.final_output) return;
+    // Ask only when this run has something to judge: a finding pins to this run's spans, so earlier
+    // turns alone would raise one with empty evidence_span_ids.
+    if (!ev.ownSpanIds.length && !(check.evidence?.final_output && finalOutput(snap))) return;
     const key = ev.spanIds.join(",") + (check.evidence?.final_output ? `|${finalOutput(snap) ?? ""}` : "");
     if (run.traceEvidence.get(check.id) === key) return;
     run.traceEvidence.set(check.id, key);
-    const own = new Set(snap.spans.map((s) => s.id));
-    const pinIds = ev.spanIds.filter((id) => own.has(id));
+    const pinIds = ev.ownSpanIds;
     const outcome = await this.decideAndApply(run, check, params, ev.text, pinIds, snap, null);
     // Not asked after all, so the run-end pass asks again; unless an overlapping pass cached newer evidence.
     if (outcome === "unavailable" && run.traceEvidence.get(check.id) === key) run.traceEvidence.delete(check.id);
@@ -1268,21 +1270,21 @@ ${library}`;
         continue;
       }
       const targets = check.scope === "span" ? selectSpans(snap.spans, check.evidence?.spans).slice(-5) : [undefined];
-      const ownIds = check.scope === "session" ? new Set(snap.spans.map((s) => s.id)) : undefined;
       for (const focus of targets) {
         // The final answer must be this run's: the merged session spans' first root is the oldest turn.
-        const ev = !isRule(check) && check.scope === "session" ? this.sessionEvidence(check, snap) : buildEvidence(snap, check.evidence, { focus });
+        const sess = !isRule(check) && check.scope === "session" ? this.sessionEvidence(check, snap) : undefined;
+        const ev = sess ?? buildEvidence(snap, check.evidence, { focus });
         if (check.scope === "session" && check.evidence?.final_output) {
           const out = finalOutput(snap);
           if (out) ev.text += `\n\nFinal answer (this run): ${clip(out, 1500)}`;
         }
-        if (!ev.spanIds.length && !check.evidence?.final_output) continue;
+        if (sess ? !sess.ownSpanIds.length && !(check.evidence?.final_output && finalOutput(snap)) : !ev.spanIds.length && !check.evidence?.final_output) continue;
         try {
           if (opts.signal?.aborted) break;
           const res = await this.decisions.decide(ev.text, [toQuestion(check, check.params ?? {})], { priority: "interactive", signal: opts.signal });
           const v = flagged(check, res);
           if (v.flagged) {
-            hits.push({ trace_id: r.trace_id, probability: v.probability, evidence_span_ids: ownIds ? ev.spanIds.filter((id) => ownIds.has(id)) : ev.spanIds, root_name: r.root_name });
+            hits.push({ trace_id: r.trace_id, probability: v.probability, evidence_span_ids: sess ? sess.ownSpanIds : ev.spanIds, root_name: r.root_name });
             break;
           }
         } catch (err) {

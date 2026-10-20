@@ -110,6 +110,36 @@ describe("scope: session", () => {
     for (const id of preview.hits[0].evidence_span_ids) expect(t2SpanIds.has(id)).toBe(true);
   });
 
+  it("still shows an earlier turn when its span ids repeat in the current run", async () => {
+    const llm = await mockLlm({ yesWhen: ["drop the constraint"] });
+    cleanup.push(llm.close);
+    const tb = await makeRoots({ llmUrl: llm.url });
+    cleanup.unshift(tb.close);
+    tb.roots.checks.save(check("session"), "user");
+
+    // Span ids are only unique within a trace: both turns' LLM spans share one id here.
+    const shared = hex(8);
+    const send = async (user: string, out: string) => {
+      const t = hex(16);
+      const root = hex(8);
+      const llmSp = llmSpan(t, root, { system: "You are a planner.", user, out, attrs: [sessionAttr] });
+      llmSp.spanId = shared;
+      tb.roots.ingest([batch([llmSp])]);
+      await tb.roots.engine!.waitIdle(t, 10_000);
+      tb.roots.ingest([batch([span({ traceId: t, spanId: root, name: "planner", kind: "workflow", attrs: [sessionAttr] }), markerSpan(t, root)])]);
+      await until(() => tb.roots.store.getSummary(t), 20_000);
+      await tb.roots.engine!.waitIdle(t, 10_000);
+      return t;
+    };
+    await send(T1_USER, "Plan drafted.");
+    const t2 = await send(T2_USER, "Emailing it Friday.");
+
+    const asked = decisionRequests(llm.requests, T2_USER);
+    expect(asked.some((b) => String(b.messages[b.messages.length - 1].content).includes("blue-472"))).toBe(true);
+    const f2 = tb.roots.store.findingsForTrace(t2).find((f) => f.check_id === "dropped-constraint");
+    expect(f2!.evidence_span_ids.length).toBeGreaterThan(0);
+  });
+
   it("keeps earlier-turn evidence when the current run has more spans than evidence.last", async () => {
     const llm = await mockLlm({ yesWhen: ["drop the constraint"] });
     cleanup.push(llm.close);
