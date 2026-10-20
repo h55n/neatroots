@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS runs (
   updated_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_started ON runs (started_ms DESC);
+-- The run list and Insights sort and filter by this expression; an index on started_ms alone can't serve them.
+CREATE INDEX IF NOT EXISTS runs_sort ON runs (COALESCE(started_ms, received_ms) DESC);
 CREATE INDEX IF NOT EXISTS runs_session ON runs (session_id);
 CREATE INDEX IF NOT EXISTS runs_workflow ON runs (workflow);
 CREATE INDEX IF NOT EXISTS runs_project ON runs (project);
@@ -473,6 +475,12 @@ export class Store {
     return json<OtlpResource>(r?.json, { attributes: [] });
   }
 
+  /** The resources a run's spans were sent with (one per sender, usually one). */
+  resourcesFor(traceId: string): OtlpResource[] {
+    const rows = this.db.prepare("SELECT DISTINCT resource_id FROM spans WHERE trace_id = ?").all(traceId) as { resource_id: string }[];
+    return rows.map((r) => this.getResource(r.resource_id));
+  }
+
   getScope(id: string): OtlpScope {
     const r = this.db.prepare("SELECT json FROM scopes WHERE id = ?").get(id) as { json: string } | undefined;
     return json<OtlpScope>(r?.json, { name: "" });
@@ -751,7 +759,9 @@ export class Store {
       where.push("session_id = @session");
       p.session = f.sessionId;
     }
-    if (f.hasFinding) where.push("finding_count > 0");
+    if (f.hasFinding !== undefined) {
+      where.push(f.hasFinding ? "finding_count > 0" : "finding_count = 0");
+    }
     if (f.hasOpenFinding) where.push("open_finding_count > 0");
     if (f.checkId) {
       where.push("trace_id IN (SELECT trace_id FROM findings WHERE check_id = @check AND status NOT IN ('dismissed', 'failed', 'quiet'))");
@@ -1472,6 +1482,30 @@ export class Store {
   /** Fills in the run and span of each search-index row, for a store from an older version. */
   rebuildSearchIds(onDone?: (rows: number, ready: boolean) => void): void {
     this.searchIds.rebuild(onDone);
+  }
+
+  /**
+   * The search index's startup work, in order: fill in its run ids, then re-index spans stored
+   * before search covered whole values. Re-indexing replaces each span's rows, which goes through
+   * the run ids once they're in; without them, it scans the whole index for every span. So if the
+   * run ids can't be filled in (a locked or failing database), it tries again twice, a minute and
+   * then two later, and the re-index waits for them or for the next start.
+   */
+  maintainSearch(onIds?: (rows: number, ready: boolean) => void, onReindex?: (n: number, ok: boolean) => void, retryMs = 60_000): void {
+    const attempt = (tries: number) =>
+      this.rebuildSearchIds((rows, ready) => {
+        // These run on later turns of the event loop, by when the store may have been closed.
+        if (!this.db.open) return;
+        if (ready) {
+          onIds?.(rows, true);
+          if (this.db.open) this.reindexSearch(onReindex);
+        } else if (tries < 3) {
+          setTimeout(() => this.db.open && attempt(tries + 1), retryMs * tries).unref();
+        } else {
+          onIds?.(rows, false);
+        }
+      });
+    attempt(1);
   }
 
   /**
