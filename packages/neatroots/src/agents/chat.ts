@@ -1,5 +1,5 @@
-import { pipeChild } from "./pipe.js";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { launchAgent, pipeChild } from "./pipe.js";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -282,8 +282,9 @@ export class AgentChats {
    * The turn is over (the agent process closed). Its result event arrives a moment earlier, so an
    * open chat that refetched on the result can still have read "running"; this tells it to look again.
    */
-  private ended(id: string, state: "idle" | "error"): void {
+  private ended(id: string, state: "idle" | "error", error?: string): void {
     if (!this.get(id)) return;
+    if (error) this.emit(id, { kind: "error", text: error });
     this.update(id, { state });
     this.roots.bus.emit("chat", { session_id: id, state });
   }
@@ -311,7 +312,8 @@ export class AgentChats {
     this.update(id, { state: "running" });
     const { args } = s.agent === "claude" ? this.claudeArgs(s, prompt) : this.codexArgs(s, prompt);
     log.debug(`chat ${id}: ${bin} ${args.slice(0, -1).join(" ")}`);
-    const child = spawn(bin, args, { cwd: s.cwd, env: { ...process.env, NEATLOGS_ENDPOINT: `http://localhost:${this.roots.config.port}` }, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    const child = launchAgent(bin, args, s.cwd, this.roots.config.port);
+    if (typeof child === "string") return this.ended(id, "error", `couldn't start the agent: ${child}`);
     this.running.set(id, child);
     let sawResult = false;
     const tail = pipeChild(child, {
